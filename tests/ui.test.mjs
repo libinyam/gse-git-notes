@@ -33,7 +33,7 @@ function key(target, k) {
 
 test('UI 粘连层：命令、解释面板、图、三个区域、tour、补全、工作目录', () => {
 
-assert.match(terminal(), /先预测，再观察/, '启动时打印欢迎语');
+assert.match(terminal(), /敲命令，看图变化/, '启动时打印欢迎语');
 assert.match(graph(), /还没有任何提交/, '空仓库说明 HEAD 指向未出生的分支');
 assert.match(el('prompt').textContent, /^lab:main\$$/, '提示符显示当前分支');
 
@@ -48,6 +48,9 @@ assert.match(explain(), /hello.c/, '解释面板列出变化的文件');
 assert.match(areas(), /hello\.c/, '三个区域面板出现文件');
 assert.match(el('tab-objects').text, /commit/, '对象库面板有 commit');
 assert.match(el('store-count').textContent, /commit×1/, '对象库统计按类型计数');
+// 执行前不再往终端里塞四个问题，解释只出现在右侧面板
+assert.doesNotMatch(terminal(), /工作区会变吗？/, '终端里没有执行前的四个问题');
+assert.doesNotMatch(terminal(), /先预测（jyy 的四个问题）/, '终端里没有预测提示');
 
 // 点一个对象看内容
 const objectRows = el('tab-objects').querySelectorAll('.row.clickable');
@@ -55,19 +58,6 @@ assert.ok(objectRows.length > 0, '对象库有可点击的行');
 objectRows.find((row) => row.text.includes('commit')).dispatch('click');
 assert.match(el('tab-objects').text, /cat-file -p/, '点击对象显示内容');
 assert.match(el('tab-objects').text, /tree [0-9a-f]{40}/, 'commit 内容里能看到 tree 行');
-
-// ---- 预测开关 --------------------------------------------------------------
-
-el('predict-toggle').checked = false;
-el('predict-toggle').dispatch('change', { target: el('predict-toggle') });
-const beforePredictOff = terminal().length;
-run('git status');
-assert.doesNotMatch(terminal().slice(beforePredictOff), /先预测（jyy 的四个问题）：/, '关掉预测后不再提问');
-el('predict-toggle').checked = true;
-el('predict-toggle').dispatch('change', { target: el('predict-toggle') });
-const beforePredictOn = terminal().length;
-run('git status');
-assert.match(terminal().slice(beforePredictOn), /先预测（jyy 的四个问题）：/, '打开预测后重新提问');
 
 // ---- 分支、切换与提示符 ----------------------------------------------------
 

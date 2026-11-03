@@ -40,16 +40,8 @@ const CHEATS = [
   'git help',
 ];
 
-const PREDICT_QUESTIONS = [
-  '工作区会变吗？',
-  '下一次提交包含什么？',
-  '哪个引用会移动？',
-  '历史里会多出什么关系？',
-];
-
 const state = {
   git: null,
-  predict: true,
   tour: null,
   history: [],
   historyIndex: -1,
@@ -100,7 +92,7 @@ function scrollTerminal() {
 function boot() {
   state.git = new Git();
   state.git.run('git init -b main');
-  print('Git 可视化讲解 · 先预测，再观察', 'dim');
+  print('Git 可视化讲解 · 敲命令，看图变化', 'dim');
   print('这个仓库跑在浏览器里：三种对象、一张 DAG、一组引用，全部由本地代码实现。', 'dim');
   print('哈希与真 git 逐字节一致（npm run oracle 可以对拍），右边每个面板都会随命令更新。', 'dim');
   print('试试：git status、git log --graph --oneline --all，或者点左侧“跟着练”。', 'dim');
@@ -126,10 +118,6 @@ function execute(line) {
   print(text, 'cmd');
 
   const before = commitHashes();
-  if (state.predict) {
-    print('⌥ 先预测（jyy 的四个问题）：', 'predict');
-    PREDICT_QUESTIONS.forEach((question, index) => print(`   ${index + 1}. ${question}`, 'predict'));
-  }
 
   const result = state.git.run(text);
   if (result.replace) {
@@ -669,9 +657,6 @@ function wire() {
   el('reset-button').addEventListener('click', resetRepo);
   el('help-button').addEventListener('click', () => {
     print(state.git.help(), 'out');
-  });
-  el('predict-toggle').addEventListener('change', (event) => {
-    state.predict = event.target.checked;
   });
   el('worktree-select').addEventListener('change', (event) => {
     try {

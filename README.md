@@ -402,7 +402,7 @@ npm run serve        # 打开 http://localhost:5173/
   - **三个区域**：工作区 / 暂存区 / HEAD 三列对照，带 blob 短哈希和状态颜色；
   - **对象库 / 引用 / reflog**：点对象可以看它的原始内容（`cat-file -p` 的效果）。
 
-打开页面时默认开着“先预测，再观察”：执行前先列出四个问题，执行后右侧给出答案。左栏的 tour 会带着走完 jyy 的那道题、制造冲突、rebase 改哈希、reset 之后用 reflog 救回来、stash 与 worktree、以及 fetch / pull / push / clone。
+每条命令执行完，右侧“这条命令做了什么”会直接回答那四个问题：工作区变不变、暂存区变不变、哪个引用会动、对象库多了什么。左栏的 tour 会带着走完 jyy 的那道题、制造冲突、rebase 改哈希、reset 之后用 reflog 救回来、stash 与 worktree、以及 fetch / pull / push / clone。
 
 想直接看某个状态，可以用查询参数：`?run=git%20status;;git%20log` 依次执行命令（用 `;;` 分隔），`?tour=merge&auto=1` 自动跑完一整个讲解。
 
