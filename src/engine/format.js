@@ -365,22 +365,44 @@ export function renderGraph(rows) {
   return output;
 }
 
-/** Diffstat lines in Git's shape: `recipe.txt | 2 +-` plus a summary. */
-export function diffStat(changes) {
-  const width = Math.max(...changes.map((change) => change.label.length), 0);
-  const maxTotal = Math.max(1, ...changes.map((change) => change.additions + change.deletions));
-  const scale = maxTotal > 40 ? 40 / maxTotal : 1;
-  const lines = changes.map((change) => {
-    const plus = Math.round(change.additions * scale);
-    const minus = Math.round(change.deletions * scale);
-    const bar = `${'+'.repeat(plus)}${'-'.repeat(minus)}`;
-    return `${change.label.padEnd(width)} | ${String(change.additions + change.deletions).padStart(4)} ${bar}`;
-  });
+/** Git assumes this many columns when it cannot see a terminal. */
+const STAT_WIDTH = 80;
+
+/** `2 files changed, 5 insertions(+), 1 deletion(-)` — the diffstat summary. */
+export function diffSummary(changes) {
   const insertions = changes.reduce((sum, change) => sum + change.additions, 0);
   const deletions = changes.reduce((sum, change) => sum + change.deletions, 0);
   const summary = [`${changes.length} file${changes.length === 1 ? '' : 's'} changed`];
   if (insertions) summary.push(`${insertions} insertion${insertions === 1 ? '' : 's'}(+)`);
   if (deletions) summary.push(`${deletions} deletion${deletions === 1 ? '' : 's'}(-)`);
-  lines.push(` ${summary.join(', ')}`);
-  return lines.map((line) => ` ${line}`);
+  return summary.join(', ');
+}
+
+/** Diffstat lines in Git's shape: `recipe.txt | 2 +-` plus a summary. */
+export function diffStat(changes, width = Math.max(...changes.map((change) => change.label.length), 0)) {
+  const totals = changes.map((change) => change.additions + change.deletions);
+  // The count column is right-aligned to the widest count, as Git prints it.
+  const countWidth = String(Math.max(1, ...totals)).length;
+  const maxTotal = Math.max(1, ...totals);
+  // ` ${name} | ${count} ${bar}` — everything but the bar has a fixed width, so
+  // the bar gets whatever is left of the 80 columns Git assumes when it cannot
+  // see a terminal. Above that the graph is scaled down to fit.
+  const graph = STAT_WIDTH - width - countWidth - 6;
+  const lines = changes.map((change, index) => {
+    const bar = statBar(change, maxTotal, graph);
+    return ` ${change.label.padEnd(width)} | ${String(totals[index]).padStart(countWidth)} ${bar}`.trimEnd();
+  });
+  lines.push(` ${diffSummary(changes)}`);
+  return lines;
+}
+
+/** The `+++---` graph for one file, scaled the way Git scales it. */
+function statBar(change, maxTotal, graph) {
+  if (graph < 1 || maxTotal <= graph) {
+    return `${'+'.repeat(change.additions)}${'-'.repeat(change.deletions)}`;
+  }
+  // The `+` side is truncated and the `-` side takes the rest of the row, so a
+  // single insertion still shows as one `+` instead of vanishing.
+  const plus = change.additions ? Math.max(1, Math.floor((change.additions * graph) / maxTotal)) : 0;
+  return `${'+'.repeat(plus)}${'-'.repeat(Math.max(0, graph - plus))}`;
 }

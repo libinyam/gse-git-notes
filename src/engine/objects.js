@@ -1,7 +1,14 @@
 import { sha1Hex } from './sha1.js';
 import { toBytes, concat, hexToBytes, bytesToHex } from './bytes.js';
 
-export class GitError extends Error {}
+/** An error Git itself would print: `message` on stderr, optional stdout lines. */
+export class GitError extends Error {
+  constructor(message, { stdout = '', exitCode = 128 } = {}) {
+    super(message);
+    this.stdout = stdout;
+    this.exitCode = exitCode;
+  }
+}
 
 function header(type, length) {
   return toBytes(`${type} ${length}\0`);

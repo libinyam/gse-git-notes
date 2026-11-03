@@ -113,6 +113,148 @@ function treeListingOurs(git) {
     .join('\n');
 }
 
+/** realGit, but a failing command returns instead of throwing. */
+function realGitAttempt(dir, args, options = {}) {
+  try {
+    return { code: 0, stdout: realGit(dir, args, options), stderr: '' };
+  } catch (error) {
+    return { code: error.status ?? 1, stdout: error.stdout ?? '', stderr: error.stderr ?? '' };
+  }
+}
+
+/**
+ * diff 对拍：同一串编辑分别交给两边，`git diff` 的输出必须逐行相同。
+ * 重点看 hunk 头的起始行号——纯新增、纯删除、增删混合三种都要和真 git 一致。
+ */
+const DIFF_EDITS = [
+  ['改第一行', 'a\nb\nc\n', 'A\nb\nc\n'],
+  ['删掉第一行', 'a\nb\nc\n', 'b\nc\n'],
+  ['末尾追加', 'a\nb\nc\n', 'a\nb\nc\nd\n'],
+  ['中间插入', 'a\nb\nc\n', 'a\nX\nb\nc\n'],
+  ['改第一行并删第三行', 'a\nb\nc\n', 'A\nb\n'],
+  ['插入空行', 'a\nb\nc\n', 'a\n\nb\nc\n'],
+  ['整个文件重写', 'a\nb\nc\n', 'x\ny\nz\nw\n'],
+];
+
+const DIFF_PROBES = [
+  ['diff'],
+  ['diff', '--cached'],
+  ['diff', 'HEAD'],
+  ['diff', '--name-only'],
+  ['diff', '--name-status'],
+  ['diff', '--stat'],
+  ['diff', 'f.txt'],
+  ['diff', '--', 'f.txt'],
+];
+
+function compareDiff(dir, git) {
+  let ok = true;
+
+  // 1. 还没有任何提交：--cached 把 HEAD 当空目录，显式写 HEAD 则报错
+  const unborn = mkdtempSync(join(tmpdir(), 'git-oracle-unborn-'));
+  const fresh = new Git();
+  try {
+    realGit(unborn, ['init', '-q', '-b', 'main', '.']);
+    fresh.run('git init -b main');
+    writeFileSync(join(unborn, 'hello.c'), 'v1\n');
+    fresh.repo.writeFile('hello.c', 'v1\n');
+    realGit(unborn, ['add', 'hello.c']);
+    fresh.run('git add hello.c');
+    ok = compare('未提交时 git diff --cached', fresh.run('git diff --cached').stdout, realGit(unborn, ['diff', '--cached']).replace(/\r/g, '')) && ok;
+    for (const args of [['diff', 'HEAD'], ['diff', '@'], ['diff', '--cached', 'HEAD'], ['diff', 'nope']]) {
+      const ours = fresh.run(`git ${args.join(' ')}`);
+      const theirs = realGitAttempt(unborn, args);
+      ok = compare(`未提交时 git ${args.join(' ')}（退出码）`, ours.code, theirs.code) && ok;
+      // 真 git 在 fatal 之后还附了两行 "Use '--' ..." 提示，模拟器只打第一行
+      ok = compare(`未提交时 git ${args.join(' ')}（报错）`, ours.stderr, theirs.stderr.split('\n')[0]) && ok;
+    }
+  } finally {
+    rmSync(unborn, { recursive: true, force: true });
+  }
+
+  // 2. 有提交之后，逐个编辑对拍各种 diff 写法
+  for (const [name, , after] of DIFF_EDITS) {
+    writeFileSync(join(dir, 'f.txt'), after);
+    git.repo.writeFile('f.txt', after);
+    for (const args of DIFF_PROBES) {
+      const label = `${name}：git ${args.join(' ')}`;
+      const ours = git.run(`git ${args.join(' ')}`);
+      const theirs = realGit(dir, args);
+      if (ours.code !== 0) {
+        console.error(`\n✗ ${label} 模拟器执行失败：${ours.stderr}`);
+        ok = false;
+        continue;
+      }
+      ok = compare(label, ours.stdout, theirs.replace(/\r/g, '')) && ok;
+    }
+    // 收尾：add + commit，让下一个编辑从干净的 HEAD 出发
+    realGit(dir, ['add', 'f.txt']);
+    git.run('git add f.txt');
+    const date = nextDate();
+    git.repo.authorTime = date.author;
+    git.repo.commitTime = date.committer;
+    realGit(dir, ['commit', '-q', '-m', `edit: ${name}`], { date });
+    git.run(`git commit -m "edit: ${name}"`);
+  }
+
+  // 3. 两个提交之间的 diff
+  ok = compare('git diff HEAD~1 HEAD', git.run('git diff HEAD~1 HEAD').stdout, realGit(dir, ['diff', 'HEAD~1', 'HEAD']).replace(/\r/g, '')) && ok;
+  ok = compare('git diff HEAD~1', git.run('git diff HEAD~1').stdout, realGit(dir, ['diff', 'HEAD~1']).replace(/\r/g, '')) && ok;
+
+  // 4. 合并冲突：组合 diff（diff --cc）、`* Unmerged path`、以及冲突中的各种写法
+  const conflict = mkdtempSync(join(tmpdir(), 'git-oracle-conflict-'));
+  const merged = new Git();
+  const step = (repo, args) => {
+    const date = nextDate();
+    repo.authorTime = date.author;
+    repo.commitTime = date.committer;
+    // 冲突的 merge 两边都以 1 退出，所以这里比退出码而不是假设成功
+    const real = realGitAttempt(conflict, args, { date });
+    const ours = repo.run(`git ${args.join(' ')}`);
+    if (ours.code !== real.code) {
+      console.error(`\n✗ 冲突场景 \`git ${args.join(' ')}\` 退出码不同：真 git ${real.code}，模拟器 ${ours.code}`);      ok = false;
+    }
+  };  try {
+    realGit(conflict, ['init', '-q', '-b', 'main', '.']);
+    merged.run('git init -b main');
+    writeFileSync(join(conflict, 'f.txt'), 'a\nb\nc\n');
+    merged.repo.writeFile('f.txt', 'a\nb\nc\n');
+    realGit(conflict, ['add', '.']);
+    merged.run('git add .');
+    step(merged, ['commit', '-q', '-m', 'base']);
+    step(merged, ['checkout', '-q', '-b', 'other']);
+    writeFileSync(join(conflict, 'f.txt'), 'a\nX\nc\n');
+    merged.repo.writeFile('f.txt', 'a\nX\nc\n');
+    step(merged, ['commit', '-q', '-am', 'other']);
+    step(merged, ['checkout', '-q', 'main']);
+    writeFileSync(join(conflict, 'f.txt'), 'a\nY\nc\n');
+    merged.repo.writeFile('f.txt', 'a\nY\nc\n');
+    step(merged, ['commit', '-q', '-am', 'ours']);
+    step(merged, ['merge', 'other']);
+    for (const args of [['diff'], ['diff', 'HEAD'], ['diff', '--cached'], ['diff', '--stat'], ['diff', '--shortstat'], ['diff', '--numstat'], ['diff', '--name-only'], ['diff', '--name-status']]) {
+      const label = `冲突中：git ${args.join(' ')}`;
+      ok = compare(label, merged.run(`git ${args.join(' ')}`).stdout, realGit(conflict, args).replace(/\r/g, '')) && ok;
+    }
+    // 工作区被改成和某一 Stage 相同：Git 仍然列出文件，但没有任何 hunk
+    for (const [label, content] of [['工作区==ours', 'a\nY\nc\n'], ['工作区==theirs', 'a\nX\nc\n'], ['工作区删掉文件', null]]) {
+      if (content === null) {
+        rmSync(join(conflict, 'f.txt'));
+        merged.repo.files.delete('f.txt');
+      } else {
+        writeFileSync(join(conflict, 'f.txt'), content);
+        merged.repo.writeFile('f.txt', content);
+      }
+      for (const args of [['diff'], ['diff', '--stat'], ['diff', '--name-status']]) {
+        const name = `${label}：git ${args.join(' ')}`;
+        ok = compare(name, merged.run(`git ${args.join(' ')}`).stdout, realGit(conflict, args).replace(/\r/g, '')) && ok;
+      }
+    }
+  } finally {
+    rmSync(conflict, { recursive: true, force: true });
+  }
+  return ok;
+}
+
 function main() {
   const dir = mkdtempSync(join(tmpdir(), 'git-oracle-'));
   const git = new Git();
@@ -156,6 +298,7 @@ function main() {
       ok = compare('工作区快照 ls-tree -r HEAD', treeListingOurs(git), treeListing(dir)) && ok;
       ok = compare('git status --short', git.run('git status --short').stdout, realGit(dir, ['status', '--short']).replace(/\r/g, '')) && ok;
       ok = compare('git ls-files', git.run('git ls-files').stdout, realGit(dir, ['ls-files']).replace(/\r/g, '')) && ok;
+      ok = compareDiff(dir, git) && ok;
     }
 
     console.log(ok ? '\n✓ 模拟器与真 git 的对象完全一致' : '\n✗ 存在差异，见上');

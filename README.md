@@ -420,11 +420,18 @@ tests/                行为测试、UI 粘连层测试、真 git 对拍
 ### 测试
 
 ```bash
-npm test           # 23 个测试：命令语义、冲突标记、rebase、reset、stash、worktree、远端，以及 UI 粘连层
-npm run oracle     # 和真 git 对拍：同一串命令，两边的对象哈希必须完全一致
+npm test           # 36 个测试：命令语义、冲突标记、rebase、reset、stash、worktree、远端、diff 输出（含组合 diff），以及 UI 粘连层
+npm run oracle     # 和真 git 对拍：同一串命令，两边的对象哈希和 diff 输出必须完全一致
+npm run oracle:stdout   # 再严一层：同一串命令，stdout / stderr / 退出码逐字节相同
 ```
 
 oracle 会把 `git init / add / commit / tag / branch / switch / merge` 这一串命令分别交给真 git 和本模拟器（用固定的作者信息和时间戳），然后比较两边的全部 blob / tree / commit。它跑通意味着：网页上看到的哈希，就是你在终端里会看到的哈希。
+
+对拍还包括 diff：一串编辑（改行、删行、追加、插入空行、整个重写）之后，`git diff`、`git diff --cached`、`git diff HEAD`、`--name-only`、`--name-status`、`--numstat`、`--stat`、`-- path` 的输出逐行相同；连"还没有任何提交"时的行为也对拍——那时 `git diff --cached` 把 HEAD 当空目录，而 `git diff HEAD`、`git diff @`、`git diff 打错的名字` 都以 128 退出并报 `fatal: ambiguous argument ...`。
+
+冲突状态也对拍：制造一次真正的合并冲突之后，`git diff` 输出组合 diff（`diff --cc`，每行一个父提交一列前缀，`@@@ -1,2 -1,2 +1,6 @@@`），`git diff --cached` 输出 `* Unmerged path`，`git diff HEAD` 仍然是普通的两方 diff；工作区被改成和某一 Stage 相同、或干脆删掉时，输出也同样逐行相同。
+
+`npm run oracle:stdout` 比的是输出本身：`git log`（含装饰的位置）、`git show`、`git status`、`git tag`、`git branch`、`git rev-parse`、`git commit` 的汇总行与 create/delete 模式、`--stat` 的 80 列缩放、切换分支时写到 stderr 的提示、`git restore --ours` / `git checkout --theirs`、以及提交被未解决冲突挡住时的 `U <path>` 和 hint。唯一的例外是装饰：网页里的终端像真终端一样默认显示 `(HEAD -> main)`，管道里的真 git 要显式 `--decorate` 才显示，所以这条对拍里一律显式带上。
 
 ### 部署
 

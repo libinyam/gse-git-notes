@@ -132,6 +132,110 @@ function short(hash) {
   return hash ? hash.slice(0, 7) : '0000000';
 }
 
+/**
+ * Combined diff for an unmerged path, in Git's `diff --cc` shape: one prefix
+ * column per parent (stage 2 = ours, stage 3 = theirs), then the working-tree
+ * result. `++` is a line in neither parent, `+ ` / ` +` a line from one side
+ * only, `  ` a line both parents share, and `-` a line a parent still has but
+ * the result dropped.
+ */
+export function combinedDiff(path, parents, result, { deleted = false } = {}) {
+  const marks = '@'.repeat(parents.length + 1);
+  const out = [`diff --${'c'.repeat(parents.length)} ${path}`];
+  out.push(`index ${parents.map((parent) => short(parent.hash)).join(',')}..0000000`);
+  if (deleted) {
+    out.push(`deleted file mode ${parents.map((parent) => parent.mode ?? '100644').join(',')}`);
+    out.push(`--- a/${path}`, '+++ /dev/null');
+    return out;
+  }
+  out.push(`--- a/${path}`, `+++ b/${path}`);
+
+  // The result matching one parent exactly is not a merge worth showing: Git
+  // still lists the file, but there is nothing left to explain.
+  if (parents.some((parent) => parent.content === result)) return out;
+
+  const resultLines = splitLines(result);
+  // Per parent: the parent line each result line lines up with (null when the
+  // result line is new to that parent), plus the parent lines the result
+  // dropped, each tagged with the gap it sat in.
+  const matches = parents.map(() => new Array(resultLines.length).fill(null));
+  const lost = parents.map(() => []);
+  parents.forEach((parent, p) => {
+    let j = 0;
+    for (const op of diffLines(splitLines(parent.content), resultLines)) {
+      if (op.type === 'ctx') matches[p][j] = op.aIndex;
+      else if (op.type === 'add') matches[p][j] = null;
+      else lost[p].push({ line: op.line, at: op.aIndex, gap: j });
+      if (op.type !== 'del') j++;
+    }
+  });
+
+  // A position is interesting when a result line is new to some parent, or when
+  // a parent line was dropped there. Positions run over result lines plus the
+  // gap after the last one, so 0..resultLines.length.
+  const interesting = new Set();
+  resultLines.forEach((_, j) => {
+    if (matches.some((match) => match[j] === null)) interesting.add(j);
+  });
+  lost.forEach((entries) => entries.forEach((entry) => interesting.add(entry.gap)));
+
+  const groups = [];
+  for (const position of [...interesting].sort((a, b) => a - b)) {
+    const last = groups[groups.length - 1];
+    if (last && position - last.stop <= HUNK_CONTEXT * 2) last.stop = position + 1;
+    else groups.push({ start: position, stop: position + 1 });
+  }
+
+  groups.forEach((group, index) => {
+    const previousStop = index === 0 ? 0 : groups[index - 1].stop;
+    const nextStart = index === groups.length - 1 ? resultLines.length + 1 : groups[index + 1].start;
+    const start = Math.max(previousStop, group.start - HUNK_CONTEXT);
+    const stop = Math.min(nextStart, group.stop + HUNK_CONTEXT);
+    const inRange = (position) => position >= start && position < stop;
+
+    const ranges = parents.map((_, p) => {
+      const covered = matches[p].map((at, j) => (inRange(j) && at !== null ? at : null)).filter((at) => at !== null);
+      for (const entry of lost[p]) if (inRange(entry.gap)) covered.push(entry.at);
+      if (!covered.length) return `-${linesBefore(matches[p], lost[p], start)},0`;
+      const first = Math.min(...covered);
+      return `-${first + 1},${Math.max(...covered) - first + 1}`;
+    });
+    const resultCount = Math.max(0, Math.min(stop, resultLines.length) - Math.min(start, resultLines.length));
+    const first = Math.min(start, resultLines.length);
+    ranges.push(`+${resultCount ? `${first + 1},${resultCount}` : `${start},0`}`);
+    out.push(`${marks} ${ranges.join(' ')} ${marks}`);
+
+    for (let position = start; position < stop; position++) {
+      // A dropped line shows `-` in the column of every parent that still had
+      // it; when both parents dropped the same line they share one output line.
+      const emitted = [];
+      parents.forEach((_, p) => {
+        for (const entry of lost[p]) {
+          if (entry.gap !== position) continue;
+          const shared = [...emitted].reverse().find((item) => item.line === entry.line && !item.cols.has(p));
+          if (shared) shared.cols.add(p);
+          else emitted.push({ line: entry.line, cols: new Set([p]) });
+        }
+      });
+      for (const item of emitted) {
+        out.push(`${parents.map((_, p) => (item.cols.has(p) ? '-' : ' ')).join('')}${item.line}`);
+      }
+      if (position < resultLines.length) {
+        out.push(`${matches.map((match) => (match[position] === null ? '+' : ' ')).join('')}${resultLines[position]}`);
+      }
+    }
+  });
+
+  return out;
+}
+
+/** Parent lines that come before `position`, for a hunk whose side is empty. */
+function linesBefore(match, entries, position) {
+  let count = match.slice(0, position).filter((at) => at !== null).length;
+  for (const entry of entries) if (entry.gap < position) count++;
+  return count;
+}
+
 /** Group an edit script into hunks with at most HUNK_CONTEXT lines of context. */
 function hunks(ops) {
   const positions = [];
@@ -164,17 +268,18 @@ function hunks(ops) {
     const start = Math.max(previousStop, group.rawStart - HUNK_CONTEXT);
     const stop = Math.min(nextStart, group.rawStop + HUNK_CONTEXT);
     const slice = ops.slice(start, stop);
-    const first = slice[0];
-    // An insertion hunk starts *between* old lines, so its old coordinate is the
-    // preceding line; a pure deletion hunk works out the same way on the new side.
-    const oldStart = first.type === 'add' ? positions[start].a : positions[start].a + 1;
-    const newStart = first.type === 'del' ? positions[start].b : positions[start].b + 1;
+    const oldCount = slice.filter((op) => op.type !== 'add').length;
+    const newCount = slice.filter((op) => op.type !== 'del').length;
+    // A hunk's start line is the last line *before* it when that side of the
+    // hunk is empty (a pure insertion has no old lines to point at), and the
+    // first line it touches otherwise. Counting the lines is what decides it —
+    // looking at the first op is wrong for a hunk that both deletes and adds.
     result.push({
       ops: slice,
-      oldStart,
-      oldCount: slice.filter((op) => op.type !== 'add').length,
-      newStart,
-      newCount: slice.filter((op) => op.type !== 'del').length,
+      oldStart: positions[start].a + (oldCount === 0 ? 0 : 1),
+      newStart: positions[start].b + (newCount === 0 ? 0 : 1),
+      oldCount,
+      newCount,
     });
   });
   return result;

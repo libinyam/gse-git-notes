@@ -268,8 +268,9 @@ export class Repo {
     const path = normalizePath(stageMatch ? rest.slice(2) : rest);
     if (!rev) {
       const entry = this.index.get(path);
-      if (!entry || entry.conflicted) return null;
-      if (stage === 0) return entry.hash;
+      if (!entry) return null;
+      // `:path` is stage 0; a conflicted path only answers `:1:`/`:2:`/`:3:`
+      if (stage === 0) return entry.conflicted ? null : entry.hash;
       return entry.conflicted?.[stage] ?? null;
     }
     const hash = this.resolveRef(rev);
@@ -433,7 +434,7 @@ export class Repo {
   }
 
   /** Replace working tree + index with a commit's snapshot. */
-  checkoutCommit(hash, { paths = null, keeping = new Set() } = {}) {
+  checkoutCommit(hash, { paths = null, keeping = new Set(), from = null } = {}) {
     const wanted = new Map(this.listTree(hash).map((entry) => [entry.path, entry]));
     if (paths) {
       for (const path of paths) {
@@ -448,8 +449,14 @@ export class Repo {
       }
       return;
     }
+    // `from` is the commit being left behind. A path that is identical on both
+    // sides keeps its local edits, the way Git carries them across a switch;
+    // only paths the checkout really changes get rewritten.
+    const previous = from ? new Map(this.listTree(from).map((entry) => [entry.path, entry])) : null;
     for (const [path, entry] of wanted) {
       if (keeping.has(path)) continue;
+      const was = previous?.get(path) ?? null;
+      if (was && was.hash === entry.hash && this.files.has(path) && this.files.get(path) !== this.objects.text(was.hash)) continue;
       this.files.set(path, this.objects.text(entry.hash));
       this.index.set(path, { mode: entry.mode, hash: entry.hash, stage: 0 });
     }

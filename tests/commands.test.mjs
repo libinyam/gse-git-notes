@@ -10,9 +10,14 @@ function lab() {
   return git;
 }
 
+/**
+ * Run a command that must succeed. Git writes progress notes ("Switched to
+ * branch ...") to stderr, so only real error lines count as failure here.
+ */
 function ok(git, line) {
   const result = git.run(line);
-  assert.equal(result.stderr, '', `unexpected error for \`${line}\`:\n${result.stderr}`);
+  const errors = String(result.stderr).split('\n').filter((text) => /^(fatal|error):/.test(text));
+  assert.deepEqual(errors, [], `unexpected error for \`${line}\`:\n${result.stderr}`);
   assert.equal(result.code, 0, `unexpected exit code for \`${line}\`:\n${result.stdout}`);
   return result.stdout;
 }
@@ -21,7 +26,7 @@ const objectCount = (git) => git.repo.objects.list().length;
 
 test('内容寻址：哈希就是“类型头 + 内容”的 SHA-1', () => {
   const git = lab();
-  assert.equal(ok(git, 'echo hello | git hash-object --stdin'), 'ce013625030ba8dba906f756967f9e9ca394464a');
+  assert.equal(ok(git, 'echo hello | git hash-object --stdin'), 'ce013625030ba8dba906f756967f9e9ca394464a\n');
 });
 
 test('jyy 的题：add 之后又改，提交进去的是 add 时的版本', () => {
@@ -32,7 +37,7 @@ test('jyy 的题：add 之后又改，提交进去的是 add 时的版本', () =
   ok(git, 'echo v2 > hello.c');
   assert.equal(objectCount(git), 1, '改工作区不会产生新对象');
   ok(git, 'git commit -m "feat: add hello"');
-  assert.equal(ok(git, 'git show HEAD:hello.c'), 'v1');
+  assert.equal(ok(git, 'git show HEAD:hello.c'), 'v1\n');
   assert.equal(ok(git, 'cat hello.c'), 'v2\n');
   assert.match(ok(git, 'git status --short'), /^ M hello\.c$/m);
   assert.match(ok(git, 'git diff'), /^-v1$/m);
@@ -63,6 +68,123 @@ test('init 之后 HEAD 指向还不存在的分支', () => {
   assert.equal(git.repo.headRef, 'refs/heads/main');
   assert.equal(git.repo.headHash(), null);
   assert.match(ok(git, 'git status'), /No commits yet/);
+});
+
+test('还没有提交时 git diff --cached 把 HEAD 当空目录', () => {
+  const git = new Git();
+  ok(git, 'git init -b main');
+  ok(git, 'echo v1 > hello.c');
+  ok(git, 'git add hello.c');
+  // 真 git 在这里输出 new file，而不是报错
+  const staged = ok(git, 'git diff --cached');
+  assert.match(staged, /^new file mode 100644$/m);
+  assert.match(staged, /^index 0000000\.\.626799f$/m);
+  assert.match(staged, /^@@ -0,0 \+1 @@$/m);
+  assert.match(staged, /^\+v1$/m);
+  assert.match(ok(git, 'git diff --staged'), /^new file mode 100644$/m);
+  // 不带 --cached 仍然是工作区 vs 暂存区
+  ok(git, 'echo v2 > hello.c');
+  assert.match(ok(git, 'git diff'), /^-v1$/m);
+  assert.match(ok(git, 'git diff'), /^\+v2$/m);
+});
+
+test('还没有提交时显式写出 HEAD 仍然报错', () => {
+  const git = new Git();
+  ok(git, 'git init -b main');
+  ok(git, 'echo v1 > hello.c');
+  ok(git, 'git add hello.c');
+  const expected = [
+    ['git diff HEAD', 'HEAD'],
+    ['git diff @', '@'],
+    ['git diff --cached HEAD', 'HEAD'],
+    ['git diff HEAD hello.c', 'HEAD'],
+    ['git diff nope', 'nope'],
+  ];
+  for (const [line, token] of expected) {
+    const result = git.run(line);
+    assert.equal(result.code, 128, `\`${line}\` 应该以 128 退出`);
+    assert.equal(result.stderr, `fatal: ambiguous argument '${token}': unknown revision or path not in the working tree.\n`);
+  }
+});
+
+test('hunk 头：起始行号按行数算，与真 git 一致', () => {
+  const cases = [
+    ['改第一行', 'a\nb\nc\n', 'A\nb\nc\n', '@@ -1,3 +1,3 @@'],
+    ['删掉第一行', 'a\nb\nc\n', 'b\nc\n', '@@ -1,3 +1,2 @@'],
+    ['末尾追加', 'a\nb\nc\n', 'a\nb\nc\nd\n', '@@ -1,3 +1,4 @@'],
+    ['中间插入', 'a\nb\nc\n', 'a\nX\nb\nc\n', '@@ -1,3 +1,4 @@'],
+    ['改第一行并删第三行', 'a\nb\nc\n', 'A\nb\n', '@@ -1,3 +1,2 @@'],
+    ['只改一行', 'v1\n', 'v2\n', '@@ -1 +1 @@'],
+  ];
+  for (const [name, before, after, header] of cases) {
+    const git = lab();
+    ok(git, `printf '${before}' > f.txt`);
+    ok(git, 'git add f.txt');
+    ok(git, 'git commit -m base');
+    ok(git, `printf '${after}' > f.txt`);
+    const out = ok(git, 'git diff');
+    assert.ok(out.includes(`\n${header}\n`), `${name}：期望 ${header}\n${out}`);
+  }
+});
+
+test('未跟踪的文件不出现在任何 diff 里，只出现在 status 里', () => {
+  const git = lab();
+  ok(git, 'echo tracked > f.txt');
+  ok(git, 'git add f.txt');
+  ok(git, 'git commit -m base');
+  ok(git, 'echo loose > u.txt');
+  assert.equal(ok(git, 'git diff'), '');
+  assert.equal(ok(git, 'git diff --cached'), '');
+  assert.equal(ok(git, 'git diff HEAD'), '');
+  assert.equal(ok(git, 'git diff --name-only'), '');
+  assert.match(ok(git, 'git status --short'), /^\?\? u\.txt$/m);
+  // add 之后就进了 diff
+  ok(git, 'git add u.txt');
+  assert.equal(ok(git, 'git diff --cached --name-only'), 'u.txt\n');
+});
+
+test('-- 之后是纯路径，认不出的路径不报错；不带 -- 就报错', () => {
+  const git = lab();
+  ok(git, 'echo a > keep.txt');
+  ok(git, 'echo b > gone.txt');
+  ok(git, 'git add .');
+  ok(git, 'git commit -m one');
+  ok(git, 'git rm gone.txt');
+  ok(git, 'git commit -m two');
+  // gone.txt 已经不在工作区和暂存区里，但仍然是两个提交之间的合法路径
+  assert.match(ok(git, 'git diff HEAD~1 HEAD -- gone.txt'), /^deleted file mode 100644$/m);
+  assert.equal(ok(git, 'git diff HEAD~1 HEAD -- missing.txt'), '');
+  const result = git.run('git diff HEAD~1 gone.txt');
+  assert.equal(result.code, 128);
+  assert.equal(result.stderr, "fatal: ambiguous argument 'gone.txt': unknown revision or path not in the working tree.\n");
+});
+
+test('--name-only 与 --name-status', () => {
+  const git = lab();
+  ok(git, "printf 'a\\nb\\n' > f.txt");
+  ok(git, 'git add f.txt');
+  ok(git, 'git commit -m base');
+  ok(git, "printf 'a\\nB\\n' > f.txt");
+  ok(git, 'echo new > n.txt');
+  ok(git, 'git add n.txt');
+  assert.equal(ok(git, 'git diff --name-only'), 'f.txt\n');
+  assert.equal(ok(git, 'git diff --cached --name-only'), 'n.txt\n');
+  assert.equal(ok(git, 'git diff --name-status'), 'M\tf.txt\n');
+  assert.equal(ok(git, 'git diff --cached --name-status'), 'A\tn.txt\n');
+  assert.match(ok(git, 'git diff --stat'), /^ f\.txt \| 2 \+-$/m);
+});
+
+test('新文件与删除整个文件的 hunk 头', () => {
+  const git = lab();
+  ok(git, 'echo only > f.txt');
+  ok(git, 'git add f.txt');
+  assert.match(ok(git, 'git diff --cached'), /^@@ -0,0 \+1 @@$/m);
+  ok(git, 'git commit -m base');
+  ok(git, 'git rm f.txt');
+  // git rm 同时动了暂存区，所以删除出现在 --cached 里，和真 git 一样
+  assert.equal(ok(git, 'git diff'), '');
+  assert.match(ok(git, 'git diff --cached'), /^deleted file mode 100644$/m);
+  assert.match(ok(git, 'git diff --cached'), /^@@ -1 \+0,0 @@$/m);
 });
 
 test('分支、fast-forward 与合并提交', () => {
@@ -125,6 +247,102 @@ test('冲突：标记写进工作区文件，status 报 both modified', () => {
   assert.equal(ok(git, 'cat recipe.txt'), '1 cup salt\n2 cups sugar\n2 eggs\n');
 });
 
+/** 一个正在冲突的仓库：ours 改成 salt，theirs 改成 sugar。 */
+function conflicted() {
+  const git = lab();
+  ok(git, 'printf "1 cup sugar\n2 eggs\n" > recipe.txt');
+  ok(git, 'git add recipe.txt');
+  ok(git, 'git commit -m "feat: recipe"');
+  ok(git, 'git branch salty');
+  ok(git, 'git branch sweet');
+  ok(git, 'git switch salty');
+  ok(git, 'printf "1 cup salt\n2 eggs\n" > recipe.txt');
+  ok(git, 'git commit -am "salt"');
+  ok(git, 'git switch sweet');
+  ok(git, 'printf "2 cups sugar\n2 eggs\n" > recipe.txt');
+  ok(git, 'git commit -am "sugar"');
+  ok(git, 'git switch main');
+  ok(git, 'git merge salty');
+  const merge = git.run('git merge sweet');
+  assert.equal(merge.code, 1);
+  return git;
+}
+
+test('冲突时 git diff 输出组合 diff（diff --cc）', () => {
+  const git = conflicted();
+  const out = ok(git, 'git diff');
+  assert.match(out, /^diff --cc recipe\.txt$/m);
+  assert.match(out, /^index [0-9a-f]{7},[0-9a-f]{7}\.\.0000000$/m);
+  assert.match(out, /^--- a\/recipe\.txt$/m);
+  assert.match(out, /^\+\+\+ b\/recipe\.txt$/m);
+  assert.match(out, /^@@@ -\d+,\d+ -\d+,\d+ \+\d+,\d+ @@@$/m);
+  // 一行一个前缀列：+ 是相对某个父提交新增，两个空格是两边都有
+  assert.match(out, /^\+\+<<<<<<< HEAD$/m);
+  assert.match(out, /^ \+1 cup salt$/m);
+  assert.match(out, /^\+\+=======$/m);
+  assert.match(out, /^\+ 2 cups sugar$/m);
+  assert.match(out, /^\+\+>>>>>>> sweet$/m);
+  // 上下文行两边都有，前缀是两个空格
+  assert.match(out, /^ {2}2 eggs$/m);
+  assert.doesNotMatch(out, /^diff --git /);
+});
+
+test('冲突时其他 diff 写法：--cached 报未合并，HEAD 是普通 diff', () => {
+  const git = conflicted();
+  assert.equal(ok(git, 'git diff --cached'), '* Unmerged path recipe.txt\n');
+  assert.equal(ok(git, 'git diff --cached HEAD'), '* Unmerged path recipe.txt\n');
+  // 和某个具体版本比是普通的两方 diff，不是组合 diff
+  const head = ok(git, 'git diff HEAD');
+  assert.match(head, /^diff --git a\/recipe\.txt b\/recipe\.txt$/m);
+  assert.match(head, /^index [0-9a-f]{7}\.\.[0-9a-f]{7} 100644$/m);
+  assert.match(head, /^@@ -\d+,\d+ \+\d+,\d+ @@$/m);
+  assert.doesNotMatch(head, /^diff --cc /);
+});
+
+test('冲突时工作区等于某一 Stage：只列文件，没有 hunk', () => {
+  const git = conflicted();
+  ok(git, 'printf "1 cup salt\n2 eggs\n" > recipe.txt');   // 等于 ours
+  const ours = ok(git, 'git diff');
+  assert.match(ours, /^diff --cc recipe\.txt$/m);
+  assert.doesNotMatch(ours, /^@@@/);
+  assert.equal(ok(git, 'git diff --stat'), ' recipe.txt | Unmerged\n 0 files changed\n');
+  assert.equal(ok(git, 'git diff --name-status'), 'U\trecipe.txt\n');
+});
+
+test('冲突时删掉工作区文件：deleted file mode 列出两个父提交的模式', () => {
+  const git = conflicted();
+  // 直接删磁盘上的文件（git rm 会把暂存区里的冲突项一起清掉）
+  git.repo.files.delete('recipe.txt');
+  const out = ok(git, 'git diff');
+  assert.match(out, /^diff --cc recipe\.txt$/m);
+  assert.match(out, /^deleted file mode 100644,100644$/m);
+  assert.match(out, /^\+\+\+ \/dev\/null$/m);
+  assert.doesNotMatch(out, /^@@@/);
+  assert.equal(ok(git, 'git diff --stat'), ' recipe.txt | Unmerged\n recipe.txt | 2 --\n 1 file changed, 2 deletions(-)\n');
+  assert.equal(ok(git, 'git diff --name-status'), 'U\trecipe.txt\nD\trecipe.txt\n');
+});
+
+test('冲突时的摘要模式：未合并那一行加上按 ours 量的常规改动', () => {
+  const git = conflicted();
+  assert.equal(ok(git, 'git diff --stat'), ' recipe.txt | Unmerged\n recipe.txt | 4 ++++\n 1 file changed, 4 insertions(+)\n');
+  assert.equal(ok(git, 'git diff --shortstat'), ' 1 file changed, 4 insertions(+)\n');
+  assert.equal(ok(git, 'git diff --numstat'), '0\t0\trecipe.txt\n4\t0\trecipe.txt\n');
+  assert.equal(ok(git, 'git diff --name-only'), 'recipe.txt\nrecipe.txt\n');
+  assert.equal(ok(git, 'git diff --name-status'), 'U\trecipe.txt\nM\trecipe.txt\n');
+});
+
+test('--numstat 与 --shortstat 的格式', () => {
+  const git = lab();
+  ok(git, "printf 'a\\nb\\n' > f.txt");
+  ok(git, 'git add f.txt');
+  ok(git, 'git commit -m base');
+  ok(git, "printf 'a\\nB\\nc\\n' > f.txt");
+  assert.equal(ok(git, 'git diff --numstat'), '2\t1\tf.txt\n');
+  assert.equal(ok(git, 'git diff --shortstat'), ' 1 file changed, 2 insertions(+), 1 deletion(-)\n');
+  // --stat 的名字列只按出现在 diff 里的文件对齐
+  assert.equal(ok(git, 'git diff --stat'), ' f.txt | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-)\n');
+});
+
 test('merge --abort 回到合并前', () => {
   const git = lab();
   ok(git, 'echo a > a.txt');
@@ -140,7 +358,7 @@ test('merge --abort 回到合并前', () => {
   git.run('git merge other');
   ok(git, 'git merge --abort');
   assert.equal(ok(git, 'cat a.txt'), 'y\n');
-  assert.equal(git.run('git merge --abort').stderr, 'fatal: There is no merge to abort');
+  assert.equal(git.run('git merge --abort').stderr, 'fatal: There is no merge to abort\n');
 });
 
 test('rebase 重放提交：哈希变了，作者不变，旧提交还在', () => {
@@ -152,7 +370,7 @@ test('rebase 重放提交：哈希变了，作者不变，旧提交还在', () =
   ok(git, 'echo t > t.txt');
   ok(git, 'git add t.txt');
   ok(git, 'git commit -m "topic"');
-  const original = ok(git, 'git rev-parse HEAD');
+  const original = ok(git, 'git rev-parse HEAD').trimEnd();
   const author = ok(git, 'git log -1 --pretty=%an');
   ok(git, 'git switch main');
   ok(git, 'echo m > m.txt');
@@ -164,17 +382,17 @@ test('rebase 重放提交：哈希变了，作者不变，旧提交还在', () =
   assert.notEqual(replayed, original, '父提交变了，哈希跟着变');
   assert.equal(ok(git, 'git log -1 --pretty=%an'), author, '作者信息保留');
   assert.equal(ok(git, 'git log --oneline'), [
-    `${replayed.slice(0, 7)} topic (HEAD -> topic)`,
-    `${ok(git, 'git rev-parse main').slice(0, 7)} feat: m (main)`,
+    `${replayed.slice(0, 7)} (HEAD -> topic) topic`,
+    `${ok(git, 'git rev-parse main').slice(0, 7)} (main) feat: m`,
     `${ok(git, 'git rev-parse main~1').slice(0, 7)} feat: a`,
-  ].join('\n'));
+  ].join('\n') + '\n');
   assert.equal(ok(git, 'git log --pretty=%h'), [
     replayed.slice(0, 7),
     ok(git, 'git rev-parse main').slice(0, 7),
     ok(git, 'git rev-parse main~1').slice(0, 7),
-  ].join('\n'), '--pretty 不带 %d 时不显示引用');
+  ].join('\n') + '\n', '--pretty 不带 %d 时不显示引用');
   assert.ok(git.repo.objects.has(original), '原来的提交还在对象库里');
-  assert.match(ok(git, 'git log --graph --oneline --all'), /^\* [0-9a-f]{7} topic \(HEAD -> topic\)$/m);
+  assert.match(ok(git, 'git log --graph --oneline --all --decorate'), /^\* [0-9a-f]{7} \(HEAD -> topic\) topic$/m);
 });
 
 test('rebase 冲突后 --continue', () => {
@@ -197,7 +415,7 @@ test('rebase 冲突后 --continue', () => {
   ok(git, 'git add f.txt');
   ok(git, 'git rebase --continue');
   assert.equal(ok(git, 'cat f.txt'), 'both\n');
-  assert.equal(ok(git, 'git log --oneline').split('\n').length, 3);
+  assert.equal(ok(git, 'git log --oneline').trimEnd().split('\n').length, 3);
 });
 
 test('reset 的三步：soft / mixed / hard', () => {
@@ -259,7 +477,7 @@ test('stash：存成特殊提交，pop 之后修改回到工作区', () => {
   ok(git, 'echo v1 > hello.c');
   ok(git, 'git add hello.c');
   ok(git, 'git commit -m "first"');
-  assert.equal(git.run('git stash').stdout, 'No local changes to save');
+  assert.equal(git.run('git stash').stdout, 'No local changes to save\n');
   ok(git, 'echo v2 > hello.c');
   assert.match(ok(git, 'git stash'), /Saved working directory and index state/);
   assert.equal(ok(git, 'git status --short'), '', 'stash 之后工作区干净');
@@ -276,17 +494,17 @@ test('tag：轻量标签是引用，附注标签是对象', () => {
   ok(git, 'echo a > a.txt');
   ok(git, 'git add a.txt');
   ok(git, 'git commit -m "feat: a"');
-  const head = ok(git, 'git rev-parse HEAD');
+  const head = ok(git, 'git rev-parse HEAD').trimEnd();
   ok(git, 'git tag v1');
-  assert.equal(ok(git, 'git rev-parse v1'), head);
-  assert.equal(ok(git, 'git cat-file -t v1'), 'commit');
+  assert.equal(ok(git, 'git rev-parse v1').trimEnd(), head);
+  assert.equal(ok(git, 'git cat-file -t v1'), 'commit\n');
   ok(git, 'git tag -a v2 -m "release"');
-  assert.equal(ok(git, 'git cat-file -t v2'), 'tag');
-  assert.equal(ok(git, 'git rev-parse v2^{commit}'), head);
-  assert.deepEqual(ok(git, 'git tag').split('\n'), ['v1', 'v2']);
+  assert.equal(ok(git, 'git cat-file -t v2'), 'tag\n');
+  assert.equal(ok(git, 'git rev-parse v2^{commit}').trimEnd(), head);
+  assert.deepEqual(ok(git, 'git tag').trimEnd().split('\n'), ['v1', 'v2']);
   assert.match(ok(git, 'git log --oneline --decorate'), /tag: v1/);
   ok(git, 'git tag -d v2');
-  assert.deepEqual(ok(git, 'git tag').split('\n'), ['v1']);
+  assert.equal(ok(git, 'git tag').trimEnd(), 'v1');
 });
 
 test('switch / restore：三个区域之间搬内容', () => {
@@ -326,14 +544,14 @@ test('detached HEAD：提交没有分支跟着走，但能用 reflog 找回', ()
   ok(git, 'echo b > b.txt');
   ok(git, 'git add b.txt');
   ok(git, 'git commit -m "detached work"');
-  const lost = ok(git, 'git rev-parse HEAD');
+  const lost = ok(git, 'git rev-parse HEAD').trimEnd();
   ok(git, 'git switch main');
   assert.equal(ok(git, 'git rev-parse HEAD') !== lost, true);
   assert.ok(git.repo.objects.has(lost));
   assert.match(ok(git, 'git reflog'), new RegExp(lost.slice(0, 7)));
   ok(git, `git switch --detach ${lost}`);
   ok(git, 'git switch -c rescued');
-  assert.equal(ok(git, 'git rev-parse HEAD'), lost);
+  assert.equal(ok(git, 'git rev-parse HEAD').trimEnd(), lost);
   assert.equal(ok(git, 'cat b.txt'), 'b\n');
 });
 
@@ -359,13 +577,13 @@ test('worktree：共享对象库和引用，各有 HEAD 与暂存区', () => {
 test('远端：clone / fetch / push 在内存里对拍', () => {
   const git = lab();
   ok(git, 'git remote add origin demo://notes');
-  assert.deepEqual(ok(git, 'git remote').split('\n'), ['origin']);
+  assert.equal(ok(git, 'git remote'), 'origin\n');
   assert.match(ok(git, 'git remote -v'), /origin\tdemo:\/\/notes \(fetch\)/);
   const fetched = ok(git, 'git fetch origin');
   assert.match(fetched, /From demo:\/\/notes/);
   assert.match(fetched, /-> origin\/main/);
-  assert.equal(ok(git, 'git rev-parse origin/main').length, 40);
-  assert.equal(ok(git, 'git ls-files'), '', 'fetch 不碰工作区');
+  assert.equal(ok(git, 'git rev-parse origin/main').trimEnd().length, 40);
+  assert.equal(ok(git, 'git ls-files').trimEnd(), '', 'fetch 不碰工作区');
 
   const pulled = git.run('git pull origin main');
   assert.equal(pulled.code, 0, pulled.stderr);
@@ -381,7 +599,7 @@ test('远端：clone / fetch / push 在内存里对拍', () => {
   assert.equal(clone.code, 0, clone.stderr);
   assert.ok(clone.replace, 'clone 产出一个新的仓库实例');
   assert.equal(ok(clone.replace, 'git ls-files').includes('local.txt'), true, '克隆拿到了推送过去的历史');
-  assert.deepEqual(ok(clone.replace, 'git remote').split('\n'), ['origin']);
+  assert.equal(ok(clone.replace, 'git remote'), 'origin\n');
 });
 
 test('cherry-pick 与 blame', () => {
@@ -399,8 +617,8 @@ test('cherry-pick 与 blame', () => {
   ok(git, 'git commit -m "other"');
   ok(git, 'git cherry-pick topic');
   assert.equal(ok(git, 'cat f.txt'), 'one\ntwo\n');
-  assert.equal(ok(git, 'git log -1 --pretty=%s'), 'two');
-  const blame = ok(git, 'git blame f.txt').split('\n');
+  assert.equal(ok(git, 'git log -1 --pretty=%s'), 'two\n');
+  const blame = ok(git, 'git blame f.txt').trimEnd().split('\n');
   assert.match(blame[0], /^[0-9a-f]{7} \(Git Learner .* 1\) one$/);
   assert.match(blame[1], /^[0-9a-f]{7} \(Git Learner .* 2\) two$/);
 });
@@ -437,14 +655,14 @@ test('config 改变提交里的作者', () => {
   ok(git, 'echo a > a.txt');
   ok(git, 'git add a.txt');
   ok(git, 'git commit -m "feat: a"');
-  assert.match(ok(git, 'git log -1 --pretty="%an <%ae>"'), /^李雷 <lilei@example\.com>$/);
+  assert.match(ok(git, 'git log -1 --pretty="%an <%ae>"'), /^李雷 <lilei@example\.com>$/m);
 });
 
 test('小管道：echo / printf / cat / 重定向', () => {
   const git = lab();
   ok(git, 'printf "line1\nline2\n" > notes.txt');
   assert.equal(ok(git, 'cat notes.txt'), 'line1\nline2\n');
-  assert.equal(ok(git, 'cat notes.txt | head -1'), 'line1');
+  assert.equal(ok(git, 'cat notes.txt | head -1'), 'line1\n');
   ok(git, 'echo more >> notes.txt');
   assert.equal(ok(git, 'cat notes.txt'), 'line1\nline2\nmore\n');
   assert.equal(git.run('cat missing.txt').code, 1);

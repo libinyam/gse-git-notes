@@ -14,10 +14,18 @@
 import { Repo, CommonStore, GitError, parseCommit, parseTag, compareText, normalizePath, subjectOf, parseGitIgnore } from './repo.js';
 import { buildTree, buildCommit, buildTag, parseTree } from './objects.js';
 import { toBytes, splitLines } from './bytes.js';
-import { diffLines, formatDiff, mergeText } from './diff.js';
-import { statusShort, statusLong, computeStatus, formatCommit, prettyLine, renderGraph, diffStat, formatDate, isoDate } from './format.js';
+import { diffLines, formatDiff, mergeText, combinedDiff } from './diff.js';
+import { statusShort, statusLong, computeStatus, formatCommit, prettyLine, renderGraph, diffStat, diffSummary, formatDate, isoDate } from './format.js';
 
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+/**
+ * Diff side for "HEAD does not exist yet". `git diff --cached` on an unborn
+ * branch compares the index against the empty tree, while spelling the
+ * revision out (`git diff HEAD`) is still an error — so this has to stay a
+ * distinct side instead of a fallback inside `contentMap('HEAD')`.
+ */
+const UNBORN_HEAD = 'unborn-head';
 
 // ---------------------------------------------------------------- shell ----
 
@@ -179,6 +187,9 @@ export class Git {
     const tokens = tokenize(text);
     const isShell = tokens.some((token) => SHELL_OPERATORS.has(token)) || SHELL_BUILTINS.has(tokens[0]);
     const result = isShell ? this.runPipeline(tokens) : this.runOne(tokens);
+    // Git terminates its output with a newline; the terminal splits on it.
+    if (result.stdout && !result.stdout.endsWith('\n')) result.stdout += '\n';
+    if (result.stderr && !result.stderr.endsWith('\n')) result.stderr += '\n';
     const effects = diffStates(before, this.snapshot(), this);
     const final = { line: text, ...result, effects, notes: this.notes };
     this.log.push({ line: text, ...final });
@@ -205,7 +216,7 @@ export class Git {
       }
       return { code: 0, stdout: Array.isArray(out) ? out.join('\n') : String(out ?? ''), stderr: '' };
     } catch (error) {
-      if (error instanceof GitError) return { code: error.exitCode ?? 128, stdout: '', stderr: error.message };
+      if (error instanceof GitError) return { code: error.exitCode ?? 128, stdout: error.stdout ?? '', stderr: error.message };
       throw error;
     }
   }
@@ -353,6 +364,19 @@ export class Git {
     );
   }
 
+  /**
+   * The working tree as a *diff* side: only files the index knows about. Git
+   * never puts untracked files in a diff — they show up in `git status` as `??`.
+   */
+  trackedWorkFiles() {
+    const out = new Map();
+    for (const [path, content] of this.repo.files) {
+      if (!this.repo.index.has(path)) continue;
+      out.set(path, { hash: this.repo.hashContent(content), mode: '100644', content });
+    }
+    return out;
+  }
+
   indexFiles() {
     const out = new Map();
     for (const [path, entry] of this.repo.index) {
@@ -362,16 +386,31 @@ export class Git {
     return out;
   }
 
-  /** Side of a diff: the working tree, the index, or a revision. */
+  /** Side of a diff: the working tree, the index, an unborn HEAD, or a revision. */
   contentMap(kind) {
     if (kind === 'work') return this.workFiles();
     if (kind === 'index') return this.indexFiles();
+    if (kind === UNBORN_HEAD) return new Map();
     return this.filesOf(kind);
   }
 
+  /**
+   * The index entries sitting at one unmerged stage — what `git checkout --ours`
+   * and `git restore --theirs` read. Stage 2 is ours, 3 is theirs.
+   */
+  stageFiles(stage) {
+    const out = new Map();
+    for (const [path, entry] of this.repo.index) {
+      const hash = entry.conflicted?.[stage];
+      if (!hash) continue;
+      out.set(path, { hash, mode: '100644', content: this.repo.objects.text(hash) });
+    }
+    return out;
+  }
+
   /** Replace working tree and index with a tree's snapshot. */
-  checkoutTree(treeHash) {
-    this.repo.checkoutCommit(treeHash);
+  checkoutTree(treeHash, { from = null } = {}) {
+    this.repo.checkoutCommit(treeHash, { from });
   }
 
   stage(path, content) {
@@ -392,24 +431,66 @@ export class Git {
     return out.sort(compareText);
   }
 
+  /**
+   * Does this name point at something that exists on one of the diff sides?
+   * Used to tell a path apart from a mistyped revision, the way Git's
+   * "unknown revision or path not in the working tree" error does.
+   */
+  isPathSpec(spec) {
+    const name = spec.endsWith('/') ? spec.slice(0, -1) : spec;
+    if (!name || name === '.') return true;
+    const universe = new Set([...this.repo.files.keys(), ...this.repo.index.keys()]);
+    const head = this.repo.headHash();
+    if (head) for (const entry of this.repo.listTree(this.treeOf(head))) universe.add(entry.path);
+    for (const path of universe) {
+      if (path === name || path.startsWith(`${name}/`)) return true;
+    }
+    return false;
+  }
+
   /** Diffstat + per-file unified diff between two content maps. */
-  renderDiff(oldMap, newMap, { stat = false, nameOnly = false, paths = [] } = {}) {
-    const all = [...new Set([...oldMap.keys(), ...newMap.keys()])].sort(compareText);
-    const out = [];
-    const changes = [];
+  renderDiff(oldMap, newMap, { stat = false, numstat = false, shortstat = false, nameOnly = false, nameStatus = false, paths = [], combine = false, notice = false } = {}) {
+    // Unmerged paths live in the index at stages 1-3, so neither side's map
+    // mentions them — they have to be added back or a deleted working file
+    // would make the whole conflict invisible.
+    const unmerged = combine || notice ? this.repo.conflictedPaths().map(({ path }) => path) : [];
+    const all = [...new Set([...oldMap.keys(), ...newMap.keys(), ...unmerged])].sort(compareText);
+
+    // First pass: what the diff actually shows. The stat name column is padded
+    // to the widest name *in the diff*, not to every path in the index.
+    const entries = [];
     for (const path of all) {
       if (paths.length && !this.selectPaths(paths, new Set([path])).length) continue;
       const before = oldMap.get(path) ?? null;
       const after = newMap.get(path) ?? null;
+      const conflict = (combine || notice) ? this.repo.index.get(path)?.conflicted ?? null : null;
+      if (conflict) {
+        entries.push({ path, conflict, after });
+        continue;
+      }
       if (before && after && before.hash === after.hash && before.mode === after.mode) continue;
-      if (stat || nameOnly) {
+      entries.push({ path, before, after });
+    }
+
+    const width = Math.max(0, ...entries.map((entry) => entry.path.length));
+    const out = [];
+    const changes = [];
+    for (const entry of entries) {
+      if (entry.conflict) {
+        this.pushUnmerged(out, changes, entry, { stat, numstat, shortstat, nameOnly, nameStatus, combine, width });
+        continue;
+      }
+      const { path, before, after } = entry;
+      if (stat || numstat || nameOnly || nameStatus || shortstat) {
         const ops = diffLines(before?.content ?? '', after?.content ?? '');
-        changes.push({
-          label: path,
-          additions: ops.filter((op) => op.type === 'add').length,
-          deletions: ops.filter((op) => op.type === 'del').length,
-        });
-        if (nameOnly) out.push(path);
+        const additions = ops.filter((op) => op.type === 'add').length;
+        const deletions = ops.filter((op) => op.type === 'del').length;
+        changes.push({ label: path, additions, deletions });
+        if (numstat) out.push(`${additions}\t${deletions}\t${path}`);
+        // `--name-status` prints one letter per file, like `git status --short`
+        else if (nameStatus) out.push(`${before === null ? 'A' : after === null ? 'D' : 'M'}\t${path}`);
+        else if (nameOnly) out.push(path);
+        else if (stat) out.push(...diffStat([{ label: path, additions, deletions }], width).slice(0, -1));
         continue;
       }
       out.push(
@@ -421,8 +502,52 @@ export class Git {
         }),
       );
     }
-    if (stat && changes.length) out.push(...diffStat(changes));
+    if (!numstat && (stat || shortstat) && (changes.length || entries.some((entry) => entry.conflict))) {
+      out.push(` ${diffSummary(changes)}`);
+    }
     return out;
+  }
+
+  /**
+   * An unmerged path never shows a plain diff: `git diff` renders a combined
+   * diff against the stages it has (ours and theirs), and every other form
+   * reports `* Unmerged path`. In the summary modes Git lists the path twice —
+   * once as unmerged, once as a normal change measured against ours.
+   */
+  pushUnmerged(out, changes, entry, { stat, numstat, shortstat, nameOnly, nameStatus, combine, width }) {
+    const { path, conflict, after } = entry;
+    const stages = [2, 3].map((stage) => conflict[stage]).filter(Boolean);
+    const parents = stages.map((hash) => ({ hash, content: this.repo.objects.text(hash), mode: '100644' }));
+    if (numstat) out.push(`0\t0\t${path}`);
+    else if (stat) out.push(` ${path.padEnd(width)} | Unmerged`);
+    else if (nameOnly) out.push(path);
+    else if (nameStatus) out.push(`U\t${path}`);
+
+    // Summary modes never print `* Unmerged path`; they report the path as
+    // unmerged above and, when the working tree is involved, once more as an
+    // ordinary change measured against ours.
+    if (stat || numstat || shortstat || nameOnly || nameStatus) {
+      if (!combine || stages.length < 2) return;
+      const ops = diffLines(splitLines(parents[0].content), after ? splitLines(after.content) : []);
+      const additions = ops.filter((op) => op.type === 'add').length;
+      const deletions = ops.filter((op) => op.type === 'del').length;
+      if (!additions && !deletions) return;
+      if (numstat) out.push(`${additions}\t${deletions}\t${path}`);
+      else if (nameStatus) out.push(`${after ? 'M' : 'D'}\t${path}`);
+      else if (nameOnly) out.push(path);
+      else if (stat) out.push(...diffStat([{ label: path, additions, deletions }], width).slice(0, -1));
+      if (stat || shortstat) changes.push({ label: path, additions, deletions });
+      return;
+    }
+
+    // `git diff --cached` and friends have no working tree to combine, and a
+    // path with a single surviving stage (modify/delete) has nothing to combine
+    // either — Git just says the path is unmerged.
+    if (!combine || stages.length < 2) {
+      out.push(`* Unmerged path ${path}`);
+      return;
+    }
+    out.push(...combinedDiff(path, parents, after?.content ?? '', { deleted: !after }));
   }
 
   /** Commit summary Git prints after `git commit`: stat plus create/delete modes. */
@@ -439,7 +564,9 @@ export class Git {
       else if (!after) out.push(` delete mode ${before.mode} ${path}`);
     }
     if (!changes.length) return out;
-    out.unshift(...diffStat(changes).map((line) => ` ${line}`.trimEnd()));
+    // `git commit` prints the summary line and the create/delete modes, but no
+    // per-file stat lines — those need `--stat`.
+    out.unshift(` ${diffSummary(changes)}`);
     return out;
   }
 
@@ -655,8 +782,17 @@ export class Git {
 
     const merging = repo.mergeState?.type === 'merge';
     if (merging && repo.conflictedPaths().length) {
+      // Git lists the unmerged paths on stdout before refusing, and its hint
+      // talks about the work tree rather than the index.
+      const unmerged = repo.conflictedPaths().map(({ path }) => path).sort(compareText).map((path) => `U\t${path}`);
       throw new GitError(
-        ['error: Committing is not possible because you have unmerged files.', 'hint: Fix them up in the index, and then use "git commit".', 'fatal: Exiting because of an unresolved conflict.'].join('\n'),
+        [
+          'error: Committing is not possible because you have unmerged files.',
+          "hint: Fix them up in the work tree, and then use 'git add/rm <file>'",
+          'hint: as appropriate to mark resolution and make a commit.',
+          'fatal: Exiting because of an unresolved conflict.',
+        ].join('\n'),
+        { stdout: unmerged.join('\n') },
       );
     }
 
@@ -711,21 +847,24 @@ export class Git {
   }
 
   cmdDiff(args) {
-    const { flags, values, args: rest } = parseArgs(args, { stat: 'flag', numstat: 'flag', nameOnly: 'flag', nameStatus: 'flag', cached: 'flag', staged: 'flag' });
-    const separator = rest.indexOf('--');
-    const paths = separator >= 0 ? rest.slice(separator + 1) : [];
+    // parseArgs eats `--` and everything after it, so split it off here first:
+    // after `--` every word is a pathspec, never a revision.
+    const separator = args.indexOf('--');
+    const { flags, values, args: rest } = parseArgs(separator >= 0 ? args.slice(0, separator) : args, { stat: 'flag', numstat: 'flag', shortstat: 'flag', 'name-only': 'flag', 'name-status': 'flag', cached: 'flag', staged: 'flag' });
+    const paths = separator >= 0 ? args.slice(separator + 1) : [];
     const revs = [];
     const extra = [];
-    for (const token of separator >= 0 ? rest.slice(0, separator) : rest) {
+    for (const token of rest) {
       if (revs.length < 2 && this.repo.revParse(token, { quiet: true })) revs.push(token);
-      else extra.push(token);
+      else if (this.isPathSpec(token)) extra.push(token);
+      else throw new GitError(`fatal: ambiguous argument '${token}': unknown revision or path not in the working tree.`);
     }
     const wanted = [...paths, ...extra];
 
     let oldKind = 'index';
     let newKind = 'work';
     if (flags.has('cached') || flags.has('staged')) {
-      oldKind = 'HEAD';
+      oldKind = this.repo.headHash() ? 'HEAD' : UNBORN_HEAD;
       newKind = 'index';
     } else if (revs.length >= 2) {
       oldKind = revs[0];
@@ -734,18 +873,29 @@ export class Git {
       oldKind = revs[0];
       newKind = 'work';
     }
-    const oldMap = this.contentMap(oldKind);
-    const newMap = this.contentMap(newKind);
+    const oldMap = oldKind === 'work' ? this.trackedWorkFiles() : this.contentMap(oldKind);
+    const newMap = newKind === 'work' ? this.trackedWorkFiles() : this.contentMap(newKind);
     if (!oldMap || !newMap) throw new GitError(`fatal: ambiguous argument '${revs.join(' ')}': unknown revision`);
-    const label = { work: '工作区', index: '暂存区', HEAD: 'HEAD' };
+    const label = { work: '工作区', index: '暂存区', HEAD: 'HEAD', [UNBORN_HEAD]: '空目录（还没有提交）' };
     const pretty = (kind) => (label[kind] ? `${label[kind]}` : kind);
     this.note(`diff 比较的是 ${pretty(oldKind)} 和 ${pretty(newKind)}`);
-    if (flags.has('cached') || flags.has('staged')) this.note('--cached 看的是“暂存区 vs HEAD”，也就是马上要提交的内容');
+    if (flags.has('cached') || flags.has('staged')) {
+      this.note(this.repo.headHash()
+        ? '--cached 看的是“暂存区 vs HEAD”，也就是马上要提交的内容'
+        : '现在还没有任何提交，Git 把 HEAD 当成空目录来比，所以暂存区里的文件都算“新文件”');
+    }
     else if (!revs.length) this.note('不带参数时 diff 看的是“工作区 vs 暂存区”，也就是还没 add 的修改');
+    const combine = oldKind === 'index' && newKind === 'work';
+    const notice = !combine && (oldKind === 'index' || newKind === 'index');
     return this.renderDiff(oldMap, newMap, {
       stat: flags.has('stat') || flags.has('numstat'),
-      nameOnly: flags.has('nameOnly') || flags.has('nameStatus'),
+      numstat: flags.has('numstat'),
+      shortstat: flags.has('shortstat'),
+      nameOnly: flags.has('name-only'),
+      nameStatus: flags.has('name-status'),
       paths: wanted,
+      combine,
+      notice,
     });
   }
 
@@ -812,7 +962,7 @@ export class Git {
 
     const rows = hashes.map((hash) => {
       const commit = parseCommit(hash, repo.objects);
-      const rowFormat = format && !/oneline/.test(format) ? format : oneline ? '%h %s%d' : '%h %s';
+      const rowFormat = format && !/oneline/.test(format) ? format : oneline ? '%h%d %s' : '%h %s';
       const text = prettyLine(repo, rowFormat, hash, commit, decorate);
       return { hash, parents: commit.parents, text };
     });
@@ -840,7 +990,7 @@ export class Git {
     const hash = this.repo.revParse(rev);
     const object = this.repo.objects.get(hash);
     if (object.type === 'tag') return splitLines(this.repo.objects.text(hash));
-    if (object.type === 'blob') return splitLines(this.repo.objects.text(hash));
+    if (object.type === 'blob') return this.repo.objects.text(hash);
     if (object.type === 'tree') return this.cmdLsTree([hash]);
     const out = formatCommit(this.repo, hash, { decorate: true });
     const commit = parseCommit(hash, this.repo.objects);
@@ -1016,7 +1166,7 @@ export class Git {
     const previous = repo.headHash() ?? target;
     repo.headRef = `refs/heads/${name}`;
     repo.headCommit = null;
-    this.checkoutTree(target);
+    this.checkoutTree(target, { from: previous });
     this.recordCheckout(previous, target, `checkout: moving from ${from} to ${name}`);
     this.note(`HEAD 改指分支 ${name}，工作区和暂存区换成它的快照`);
   }
@@ -1028,7 +1178,7 @@ export class Git {
     const previous = repo.headHash() ?? hash;
     repo.headRef = null;
     repo.headCommit = hash;
-    this.checkoutTree(hash);
+    this.checkoutTree(hash, { from: previous });
     this.recordCheckout(previous, hash, `checkout: moving from ${from} to ${this.short(hash)}`);
     this.note('detached HEAD：HEAD 直接指向 commit 而不指向分支，在这里提交没有任何分支会跟着前移');
   }
@@ -1145,24 +1295,25 @@ export class Git {
       if (repo.refs.has(ref) && !force) throw new GitError(`fatal: a branch named '${name}' already exists`);
       repo.updateRef(ref, hash, `branch: Created from ${start}`);
       this.switchTo(name);
-      return [`Switched to a new branch '${name}'`];
+      // Git 把切换分支的提示写到 stderr
+      return { code: 0, stdout: '', stderr: `Switched to a new branch '${name}'` };
     }
     const name = rest[0];
     if (!name) throw new GitError('fatal: missing branch or commit argument');
     if (flags.has('detach')) {
       const hash = this.resolveCommit(name);
       this.detachTo(hash);
-      return [`HEAD is now at ${this.short(hash)} ${subjectOf(parseCommit(hash, repo.objects).message)}`];
+      return { code: 0, stdout: '', stderr: `HEAD is now at ${this.short(hash)} ${subjectOf(parseCommit(hash, repo.objects).message)}` };
     }
     if (repo.refs.has(`refs/heads/${name}`)) {
       this.switchTo(name);
-      return [`Switched to branch '${name}'`];
+      return { code: 0, stdout: '', stderr: `Switched to branch '${name}'` };
     }
     throw new GitError([`fatal: invalid reference: ${name}`, `hint: If you meant to create a new branch, use 'git switch -c ${name}'.`].join('\n'));
   }
 
   cmdCheckout(args) {
-    const { flags, args: rest } = parseArgs(args, { b: 'flag', B: 'flag', detach: 'flag', orphan: 'flag' });
+    const { flags, args: rest } = parseArgs(args, { b: 'flag', B: 'flag', detach: 'flag', orphan: 'flag', ours: 'flag', theirs: 'flag' });
     const repo = this.repo;
     if (flags.has('b') || flags.has('B')) {
       const [name, start] = rest;
@@ -1176,6 +1327,14 @@ export class Git {
       revPart.length = 0;
     }
     if (pathPart.length) {
+      // `git checkout --ours/--theirs <path>` restores one side of a conflict
+      // into the working tree and leaves the unmerged index alone.
+      const stage = flags.has('ours') ? 2 : flags.has('theirs') ? 3 : null;
+      if (stage) {
+        this.cmdRestore([`--${stage === 2 ? 'ours' : 'theirs'}`, ...pathPart]);
+        // Git reports this on stderr, like its other progress messages.
+        return { code: 0, stdout: '', stderr: `Updated ${pathPart.length} path${pathPart.length === 1 ? '' : 's'} from the index` };
+      }
       const source = revPart[0] ?? 'HEAD';
       return this.cmdRestore([`--source=${source}`, '--worktree', '--staged', ...pathPart]);
     }
@@ -1183,12 +1342,12 @@ export class Git {
     if (!name) throw new GitError('fatal: you must specify a branch name');
     if (repo.refs.has(`refs/heads/${name}`)) {
       this.switchTo(name);
-      return [`Switched to branch '${name}'`];
+      return { code: 0, stdout: '', stderr: `Switched to branch '${name}'` };
     }
     const hash = this.resolveCommit(name, { quiet: true });
     if (!hash) throw new GitError([`error: pathspec '${name}' did not match any file(s) known to git`].join('\n'));
     this.detachTo(hash);
-    return [`HEAD is now at ${this.short(hash)} ${subjectOf(parseCommit(hash, repo.objects).message)}`];
+    return { code: 0, stdout: '', stderr: `HEAD is now at ${this.short(hash)} ${subjectOf(parseCommit(hash, repo.objects).message)}` };
   }
 
   cmdRestore(args) {
@@ -1198,9 +1357,19 @@ export class Git {
       staged: 'flag',
       worktree: 'flag',
       W: 'flag',
+      ours: 'flag',
+      theirs: 'flag',
+      base: 'flag',
     });
     const repo = this.repo;
+    // `--ours` / `--theirs` are shorthand for the matching stage. Git has no
+    // `--base` for restore, and `--source=:2` is not a source it can resolve.
+    const stage = flags.has('ours') ? 2 : flags.has('theirs') ? 3 : null;
     const source = values.get('source') ?? values.get('S');
+    if (source !== undefined && /^:[0-9]$/.test(source)) {
+      throw new GitError(`fatal: could not resolve '${source}'`);
+    }
+    const stages = stage ? this.stageFiles(stage) : null;
     const staged = flags.has('staged');
     const worktree = flags.has('worktree') || flags.has('W') || !staged;
     const separator = rest.indexOf('--');
@@ -1218,11 +1387,11 @@ export class Git {
           this.note(`--staged 把 ${path} 的暂存区内容恢复成 ${source ?? 'HEAD'} 的版本，工作区不动`);
         }
         if (worktree) {
-          const from = source ? this.filesOf(source) : this.indexFiles();
+          const from = stages ?? (source ? this.filesOf(source) : this.indexFiles());
           const entry = from.get(path);
           if (entry) this.writeWork(path, entry.content);
           else this.repo.removeFile(path);
-          if (!staged) this.note(`工作区的 ${path} 被恢复成${source ? ` ${source}` : '暂存区'}的版本`);
+          if (!staged) this.note(`工作区的 ${path} 被恢复成${stages ? '冲突里' + (stage === 2 ? '我们' : '他们') + '的那一侧' : source ? ` ${source}` : '暂存区'}的版本`);
         }
       }
     }
@@ -1371,7 +1540,16 @@ export class Git {
     const state = repo.mergeState;
     if (!state) throw new GitError('fatal: There is no merge in progress');
     if (repo.conflictedPaths().length) {
-      throw new GitError(['error: Committing is not possible because you have unmerged files.', 'fatal: Exiting because of an unresolved conflict.'].join('\n'));
+      const unmerged = repo.conflictedPaths().map(({ path }) => path).sort(compareText).map((path) => `U\t${path}`);
+      throw new GitError(
+        [
+          'error: Committing is not possible because you have unmerged files.',
+          "hint: Fix them up in the work tree, and then use 'git add/rm <file>'",
+          'hint: as appropriate to mark resolution and make a commit.',
+          'fatal: Exiting because of an unresolved conflict.',
+        ].join('\n'),
+        { stdout: unmerged.join('\n') },
+      );
     }
     const parents = state.type === 'merge' ? state.parents : state.head ? [state.head] : [];
     const hash = repo.writeCommit({ tree: repo.writeTreeFromIndex(), parents, message: state.message });
@@ -1567,7 +1745,7 @@ export class Git {
     }
     this.checkoutTree(target);
     this.note('--hard 连工作区一起重置：没提交的修改直接消失，reflog 也救不回来');
-    return [`HEAD is now at ${this.short(target)} ${subjectOf(parseCommit(target, repo.objects).message)}`];
+    return { code: 0, stdout: '', stderr: `HEAD is now at ${this.short(target)} ${subjectOf(parseCommit(target, repo.objects).message)}` };
   }
 
   cmdStash(args) {
