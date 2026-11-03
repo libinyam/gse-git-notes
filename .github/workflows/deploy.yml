@@ -1,0 +1,66 @@
+name: 测试并部署网页
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 跑测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 行为测试与 UI 粘连层测试
+        run: npm test
+
+      - name: 与真 git 对拍对象哈希
+        run: npm run oracle
+
+  deploy:
+    name: 部署到 GitHub Pages
+    needs: test
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      # 网页是纯静态的：只要 index.html、web/ 和它 import 的 src/engine。
+      # 测试、讲义和工具脚本不发布。
+      - name: 组装静态站点
+        run: |
+          mkdir -p _site
+          cp index.html _site/index.html
+          cp -r web _site/web
+          cp -r src _site/src
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

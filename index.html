@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Git 可视化讲解 · 项目是由原子变更推进的快照</title>
+    <link rel="stylesheet" href="web/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">⌥</span>
+        <div>
+          <h1>Git 可视化讲解</h1>
+          <p>项目是由原子变更推进的快照，可以分支，可以合并。——在浏览器里敲命令，看图变化</p>
+        </div>
+      </div>
+      <div class="controls">
+        <label class="worktree-picker">
+          工作目录
+          <select id="worktree-select" title="git worktree"></select>
+        </label>
+        <label class="toggle" title="执行前先回答四个问题，执行后对照答案">
+          <input type="checkbox" id="predict-toggle" checked />
+          <span>先预测，再观察</span>
+        </label>
+        <button id="reset-button" class="ghost" title="重新初始化这个练习仓库">重置仓库</button>
+        <button id="help-button" class="ghost" title="查看支持的命令">命令清单</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- 左：讲解与脚本 -->
+      <aside class="column narrow">
+        <section class="panel" id="model-panel">
+          <h2>数据模型</h2>
+          <dl class="model">
+            <dt>blob</dt>
+            <dd>文件内容本身，不含文件名</dd>
+            <dt>tree</dt>
+            <dd>目录：名字 → blob 或子 tree</dd>
+            <dt>commit</dt>
+            <dd>父提交 + 元信息 + 顶层 tree</dd>
+            <dt>引用</dt>
+            <dd>名字 → commit 哈希；分支、HEAD、标签都是引用，也是唯一会变的东西</dd>
+          </dl>
+          <p class="hint">每条命令都可以翻译成：往对象库里加了什么，挪了哪个引用。</p>
+        </section>
+
+        <section class="panel" id="tour-panel">
+          <h2>跟着练</h2>
+          <ol class="tour-list" id="tour-list"></ol>
+          <div class="tour-stage" id="tour-stage" hidden>
+            <p class="tour-say" id="tour-say"></p>
+            <div class="tour-buttons">
+              <button id="tour-prev" class="ghost small">上一步</button>
+              <button id="tour-next" class="primary small">执行下一步</button>
+            </div>
+            <p class="tour-progress" id="tour-progress"></p>
+          </div>
+        </section>
+
+        <section class="panel" id="cheat-panel">
+          <h2>命令速查</h2>
+          <p class="hint">点一下填入输入框；也支持 <code>echo</code>、<code>printf</code>、<code>cat</code>、<code>&gt;</code> 重定向和 <code>|</code> 管道。</p>
+          <div class="cheats" id="cheats"></div>
+        </section>
+      </aside>
+
+      <!-- 中：终端 -->
+      <section class="column terminal-column">
+        <div class="panel terminal-panel">
+          <div class="panel-head">
+            <h2>终端</h2>
+            <span class="prompt-hint" id="prompt-hint">lab:main$</span>
+          </div>
+          <div class="terminal" id="terminal" tabindex="0"></div>
+          <form class="input-row" id="command-form" autocomplete="off">
+            <span class="prompt" id="prompt">lab:main$</span>
+            <input id="command-input" spellcheck="false" aria-label="git 命令" placeholder="输入 git 命令，例如 git status" />
+          </form>
+        </div>
+      </section>
+
+      <!-- 右：可视化 -->
+      <section class="column wide">
+        <section class="panel" id="explain-panel">
+          <h2>这条命令做了什么</h2>
+          <div id="explain" class="explain">
+            <p class="empty">执行一条命令，这里会回答 jyy 的那四个问题：工作区变不变？暂存区变不变？哪个引用会动？对象库多了什么？</p>
+          </div>
+        </section>
+
+        <section class="panel" id="graph-panel">
+          <div class="panel-head">
+            <h2>提交图（DAG）</h2>
+            <span class="hint">箭头指向父提交，表示“来自”</span>
+          </div>
+          <div id="graph" class="graph"></div>
+        </section>
+
+        <section class="panel" id="areas-panel">
+          <h2>三个区域</h2>
+          <div class="areas" id="areas"></div>
+        </section>
+
+        <section class="panel" id="store-panel">
+          <div class="panel-head tabs">
+            <button class="tab active" data-tab="objects">对象库</button>
+            <button class="tab" data-tab="refs">引用</button>
+            <button class="tab" data-tab="reflog">reflog</button>
+            <span class="hint" id="store-count"></span>
+          </div>
+          <div class="tab-body" id="tab-objects"></div>
+          <div class="tab-body" id="tab-refs" hidden></div>
+          <div class="tab-body" id="tab-reflog" hidden></div>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="web/app.js"></script>
+  </body>
+</html>

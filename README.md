@@ -380,7 +380,61 @@ git worktree add -b agent-ui ../git-lab-ui && git worktree list
 
 （macOS 自带的 `sed` 需要写成 `sed -i ''`。）
 
-跑完这一遍，可以再去玩 [Learn Git Branching](https://learngitbranching.js.org/)，Missing Semester 推荐了它，jyy 课上也拿它和 gitv 做过比较。它把 rebase、cherry-pick 这些操作画成动画，正好用来检验你脑子里的图对不对。
+跑完这一遍，可以再去玩 [Learn Git Branching](https://learngitbranching.js.org/)，Missing Semester 推荐了它，jyy 课上也拿它和 gitv 做过比较。它把 rebase、cherry-pick 这些操作画成动画，正好用来检验你脑子里的图对不对。不想装任何东西的话，这个仓库自带的网页版（下一节）把同样的练习搬进了浏览器。
+
+---
+
+## 十、网页版：在浏览器里敲命令，看图变化
+
+上面那串命令要自己盯着终端想；这个仓库还带了一个网页版，把“想”这一步也摆到眼前。它不调用真 git，而是用 `src/engine/` 里的一份数据模型在浏览器里跑：三种对象、一张 DAG、一组引用，全部本地实现，哈希与真 git 逐字节一致（见下面的对拍）。
+
+```bash
+npm run serve        # 打开 http://localhost:5173/
+```
+
+页面分三栏：
+
+- **左栏**：数据模型速查、七个“跟着练”的脚本讲解、命令速查（点一下填入输入框）。
+- **中栏**：终端。除了 git 命令，还支持 `echo`、`printf`、`cat`、`head`、`>` / `>>` 重定向、`|` 管道和 `&&`，所以第九节那串菜谱可以原样粘进去。
+- **右栏**：四个随命令更新的面板——
+  - **这条命令做了什么**：直接回答 jyy 的四个问题（工作区变不变、暂存区变不变、哪个引用会动、对象库多了什么），并解释原因；
+  - **提交图（DAG）**：一行一个提交，一条泳道一个待处理的父提交，箭头指向父提交；HEAD、分支、标签、远端跟踪引用都标在节点上，合并提交有标记，新提交高亮；
+  - **三个区域**：工作区 / 暂存区 / HEAD 三列对照，带 blob 短哈希和状态颜色；
+  - **对象库 / 引用 / reflog**：点对象可以看它的原始内容（`cat-file -p` 的效果）。
+
+打开页面时默认开着“先预测，再观察”：执行前先列出四个问题，执行后右侧给出答案。左栏的 tour 会带着走完 jyy 的那道题、制造冲突、rebase 改哈希、reset 之后用 reflog 救回来、stash 与 worktree、以及 fetch / pull / push / clone。
+
+想直接看某个状态，可以用查询参数：`?run=git%20status;;git%20log` 依次执行命令（用 `;;` 分隔），`?tour=merge&auto=1` 自动跑完一整个讲解。
+
+### 代码结构
+
+```
+index.html            页面骨架
+web/app.js            终端、四个面板、tour 控制器
+web/graph.js          DAG 的 SVG 渲染（泳道分配 + 箭头）
+web/tours.js          七个脚本化讲解
+src/engine/           数据模型与命令层（浏览器和 Node 共用）
+tests/                行为测试、UI 粘连层测试、真 git 对拍
+```
+
+### 测试
+
+```bash
+npm test           # 23 个测试：命令语义、冲突标记、rebase、reset、stash、worktree、远端，以及 UI 粘连层
+npm run oracle     # 和真 git 对拍：同一串命令，两边的对象哈希必须完全一致
+```
+
+oracle 会把 `git init / add / commit / tag / branch / switch / merge` 这一串命令分别交给真 git 和本模拟器（用固定的作者信息和时间戳），然后比较两边的全部 blob / tree / commit。它跑通意味着：网页上看到的哈希，就是你在终端里会看到的哈希。
+
+### 部署
+
+推送到 `main`（或在 Actions 页面手动 `workflow_dispatch`）时，`.github/workflows/deploy.yml` 会先跑 `npm test` 和 `npm run oracle`，通过后把 `index.html`、`web/`、`src/` 组装成静态站点发到 GitHub Pages：
+
+```bash
+git push origin main
+```
+
+发布地址是 `https://libinyam.github.io/gse-git-notes/`（第一次部署前需要在仓库的 Settings → Pages → Build and deployment 里把 Source 设为 **GitHub Actions**）。
 
 ---
 
